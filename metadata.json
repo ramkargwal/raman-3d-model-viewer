@@ -1,0 +1,8 @@
+{
+  "name": "Remix 3D Model Viewer",
+  "description": "Real-time WebGL 3D model viewer for .glb and .gltf files with interactive orbit controls, studio lighting adjustments, and real-time Z-axis exaggeration scaling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
