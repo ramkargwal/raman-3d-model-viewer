@@ -1,9 +1,14 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ColorDistributionMode,
+  ColorMapInterpolationMode,
+  ElevationColorConfig,
   MapClickPointInfo,
   WaterLevelConfig,
   ZScaleConfig,
+  getRedistributedColorStops,
   roundScale,
+  validateElevationColorRange,
   validateWaterRange,
   validateWaterStep,
   validateZRange,
@@ -14,12 +19,15 @@ import {
   AlertTriangle,
   MapPin,
   Droplets,
+  Palette,
+  Upload,
   X,
 } from 'lucide-react';
 
 export interface ControlPanelProps {
   zScaleConfig: ZScaleConfig;
   waterConfig: WaterLevelConfig;
+  colorConfig: ElevationColorConfig;
   clickedPoint: MapClickPointInfo | null;
   hoveredPoint: MapClickPointInfo | null;
   onZScaleChange: (newScale: number) => void;
@@ -31,12 +39,24 @@ export interface ControlPanelProps {
   onCustomWaterLevelInput: (rawLevel: string | number) => void;
   onWaterRangeChange: (newMin: number, newMax: number) => void;
   onWaterStepChange: (newStep: number) => void;
+  onToggleCustomColor: (enabled: boolean) => void;
+  onColorRangeChange: (newMin: number, newMax: number) => void;
+  onColorDomainChange: (
+    newDomainMin: number,
+    newDomainMax: number,
+    changedBound?: 'min' | 'max' | 'both'
+  ) => void;
+  onColorDistributionModeChange: (mode: ColorDistributionMode) => void;
+  onColorInterpolationChange: (mode: ColorMapInterpolationMode) => void;
+  onUploadColorMapFile: (file: File) => void;
+  onResetColorConfig: () => void;
   onClearClickedPoint: () => void;
 }
 
 export const ControlPanel: React.FC<ControlPanelProps> = ({
   zScaleConfig,
   waterConfig,
+  colorConfig,
   clickedPoint,
   hoveredPoint,
   onZScaleChange,
@@ -48,6 +68,13 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   onCustomWaterLevelInput,
   onWaterRangeChange,
   onWaterStepChange,
+  onToggleCustomColor,
+  onColorRangeChange,
+  onColorDomainChange,
+  onColorDistributionModeChange,
+  onColorInterpolationChange,
+  onUploadColorMapFile,
+  onResetColorConfig,
   onClearClickedPoint,
 }) => {
   // Z-Axis Scale inputs
@@ -75,6 +102,18 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   const isWaterMinFocusedRef = useRef<boolean>(false);
   const isWaterMaxFocusedRef = useRef<boolean>(false);
   const isWaterStepFocusedRef = useRef<boolean>(false);
+
+  // Custom Elevation Color inputs (bound strictly to domainMin / domainMax so moving sliders never changes input box values)
+  const [colorMinInput, setColorMinInput] = useState<string>(
+    String(colorConfig.domainMin)
+  );
+  const [colorMaxInput, setColorMaxInput] = useState<string>(
+    String(colorConfig.domainMax)
+  );
+  const [colorRangeError, setColorRangeError] = useState<string | null>(null);
+  const isColorMinFocusedRef = useRef<boolean>(false);
+  const isColorMaxFocusedRef = useRef<boolean>(false);
+  const colorFileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (!isMinFocusedRef.current) {
@@ -115,6 +154,16 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
       setWaterLevelError(null);
     }
   }, [waterConfig.level]);
+
+  useEffect(() => {
+    if (!isColorMinFocusedRef.current) {
+      setColorMinInput(String(colorConfig.domainMin));
+    }
+    if (!isColorMaxFocusedRef.current) {
+      setColorMaxInput(String(colorConfig.domainMax));
+    }
+    setColorRangeError(null);
+  }, [colorConfig.domainMin, colorConfig.domainMax]);
 
   const handleMinOrMaxChange = (nextMinRaw: string, nextMaxRaw: string) => {
     setMinInput(nextMinRaw);
@@ -227,12 +276,117 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
     setWaterLevelError(null);
   };
 
+  // Custom Elevation Color handlers
+  const handleColorMinOrMaxInputChange = (
+    nextMinRaw: string,
+    nextMaxRaw: string,
+    changedBound: 'min' | 'max'
+  ) => {
+    setColorMinInput(nextMinRaw);
+    setColorMaxInput(nextMaxRaw);
+
+    const minTrimmed = nextMinRaw.trim();
+    const maxTrimmed = nextMaxRaw.trim();
+    if (minTrimmed === '' || maxTrimmed === '') {
+      setColorRangeError(null);
+      return;
+    }
+
+    const validation = validateElevationColorRange(
+      minTrimmed,
+      maxTrimmed,
+      colorConfig.domainMin,
+      colorConfig.domainMax
+    );
+    if (!validation.valid) {
+      // Do not flash error while typing partial digits in Max (m) that haven't reached Min (m) yet
+      if (
+        isColorMaxFocusedRef.current &&
+        Number.isFinite(Number(maxTrimmed)) &&
+        Number(maxTrimmed) >= 0 &&
+        Number(maxTrimmed) < colorConfig.domainMin
+      ) {
+        setColorRangeError(null);
+        return;
+      }
+      setColorRangeError(validation.error);
+      return;
+    }
+
+    setColorRangeError(null);
+    onColorDomainChange(validation.min, validation.max, changedBound);
+  };
+
+  const commitColorMinInput = () => {
+    const parsed = Number(colorMinInput.trim());
+    if (!colorMinInput.trim() || !Number.isFinite(parsed) || parsed < 0) {
+      setColorMinInput(String(colorConfig.domainMin));
+      setColorRangeError(null);
+      return;
+    }
+    const nextMin = roundScale(Math.max(0, parsed));
+    const nextMax = Math.max(nextMin, colorConfig.domainMax);
+    onColorDomainChange(nextMin, nextMax, 'min');
+    setColorMinInput(String(nextMin));
+    setColorMaxInput(String(nextMax));
+    setColorRangeError(null);
+  };
+
+  const commitColorMaxInput = () => {
+    const parsed = Number(colorMaxInput.trim());
+    if (!colorMaxInput.trim() || !Number.isFinite(parsed) || parsed < 0) {
+      setColorMaxInput(String(colorConfig.domainMax));
+      setColorRangeError(null);
+      return;
+    }
+    const nextMax = roundScale(Math.max(0, parsed));
+    const nextMin = Math.min(colorConfig.domainMin, nextMax);
+    onColorDomainChange(nextMin, nextMax, 'max');
+    setColorMinInput(String(nextMin));
+    setColorMaxInput(String(nextMax));
+    setColorRangeError(null);
+  };
+
+  const handleColorFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      onUploadColorMapFile(file);
+      e.target.value = '';
+    }
+  };
+
+  const gradientCss = useMemo(() => {
+    const redistributedStops = getRedistributedColorStops({
+      stops: colorConfig.stops,
+      distributionMode: colorConfig.distributionMode,
+      minElevation: 0,
+      maxElevation: 1,
+    });
+    if (redistributedStops.length === 0) {
+      return 'linear-gradient(to right, #0284c7, #16a34a, #eab308, #dc2626)';
+    }
+    if (colorConfig.interpolation !== 'INTERPOLATED') {
+      const n = redistributedStops.length;
+      const parts: string[] = [];
+      for (let i = 0; i < n; i++) {
+        const startPct = Math.round((i / n) * 100);
+        const endPct = Math.round(((i + 1) / n) * 100);
+        parts.push(`${redistributedStops[i].hex} ${startPct}% ${endPct}%`);
+      }
+      return `linear-gradient(to right, ${parts.join(', ')})`;
+    }
+    const stopsStr = redistributedStops
+      .map((s) => `${s.hex} ${(s.ratio * 100).toFixed(1)}%`)
+      .join(', ');
+    return `linear-gradient(to right, ${stopsStr})`;
+  }, [colorConfig.stops, colorConfig.distributionMode, colorConfig.interpolation]);
+
   const activePoint = clickedPoint ?? hoveredPoint;
 
   return (
     <aside
       aria-label="Elevation Control Card"
-      className="absolute top-3.5 right-3.5 z-10 w-72 rounded-xl bg-slate-900/95 backdrop-blur-md border border-slate-800 shadow-2xl overflow-hidden"
+      className="absolute top-3.5 right-3.5 z-10 w-76 max-h-[calc(100%-1.75rem)] overflow-y-auto rounded-xl bg-slate-900/95 border border-slate-800 shadow-2xl"
     >
       {/* SECTION 1: Z-Axis Scale Control */}
       <section className="p-3.5 border-b border-slate-800 space-y-3">
@@ -394,7 +548,322 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
         )}
       </section>
 
-      {/* SECTION 2: Collapsible Water Level / Flood Simulation Control */}
+      {/* SECTION 2: Collapsible Custom Elevation Color Map Control */}
+      <section className="p-3.5 border-b border-slate-800 space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <label className="inline-flex items-center gap-1.5 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={colorConfig.enabled}
+              onChange={(e) => onToggleCustomColor(e.target.checked)}
+              aria-label="Enable Custom Elevation Color"
+              data-testid="custom-color-checkbox"
+              className="w-3.5 h-3.5 rounded border-slate-700 bg-slate-800 text-sky-500 focus:ring-sky-400 cursor-pointer"
+            />
+            <Palette className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+            <span className="text-xs font-semibold text-slate-100">
+              Customize Color
+            </span>
+          </label>
+
+          {!colorConfig.enabled ? (
+            <span
+              data-testid="custom-color-status"
+              className="text-xs font-mono-tabular font-medium text-slate-500"
+            >
+              Default
+            </span>
+          ) : (
+            <button
+              type="button"
+              onClick={onResetColorConfig}
+              data-testid="reset-color-range-btn"
+              className="flex items-center gap-1 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 text-[11px] font-medium text-slate-200 transition-colors cursor-pointer"
+            >
+              <RotateCcw className="w-3 h-3 text-sky-400" />
+              <span>Reset</span>
+            </button>
+          )}
+        </div>
+
+        {/* Only show Custom Color controls when checkbox is activated */}
+        {colorConfig.enabled && (
+          <div data-testid="custom-color-controls" className="space-y-3 pt-0.5">
+            {/* QGIS Color File Upload & Active File Name */}
+            <div className="flex items-center justify-between gap-2 rounded-lg bg-slate-950 border border-slate-800 px-2.5 py-1.5">
+              <div className="min-w-0 flex-1">
+                <div className="text-[10px] text-slate-400">QGIS Color File</div>
+                <div
+                  data-testid="active-color-filename"
+                  className="text-xs font-mono-tabular font-medium text-slate-200 truncate"
+                  title={colorConfig.fileName}
+                >
+                  {colorConfig.fileName}
+                </div>
+              </div>
+
+              <input
+                ref={colorFileInputRef}
+                type="file"
+                accept=".txt,.clr,.csv"
+                onChange={handleColorFileSelect}
+                aria-label="Upload QGIS Color Map File"
+                data-testid="color-file-upload-input"
+                className="hidden"
+              />
+
+              <button
+                type="button"
+                onClick={() => colorFileInputRef.current?.click()}
+                data-testid="upload-color-map-btn"
+                className="flex items-center gap-1 rounded-md bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/40 px-2 py-1 text-[11px] font-semibold text-sky-300 transition-colors cursor-pointer shrink-0 whitespace-nowrap"
+              >
+                <Upload className="w-3 h-3" />
+                <span>Upload .txt</span>
+              </button>
+            </div>
+
+            {/* Color Band Only (8 individual color-value markers removed) */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-[10px] font-mono-tabular text-slate-400">
+                <span>{colorConfig.minElevation} m</span>
+                <span>
+                  {Math.round(
+                    (colorConfig.minElevation + colorConfig.maxElevation) / 2
+                  )}{' '}
+                  m
+                </span>
+                <span>{colorConfig.maxElevation} m</span>
+              </div>
+
+              <div
+                data-testid="color-ramp-preview"
+                className="h-3.5 w-full rounded-md border border-slate-700"
+                style={{ background: gradientCss }}
+              />
+            </div>
+
+            {/* Side-by-Side Sliders: Minimum Value on Left, Maximum Value on Right */}
+            <div className="grid grid-cols-2 gap-3 pt-0.5">
+              {/* Left Column: Minimum Value Slider & Input */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-1">
+                  <label
+                    htmlFor="color-min-elevation-input"
+                    className="text-[11px] font-medium text-slate-300 whitespace-nowrap"
+                  >
+                    Min (m)
+                  </label>
+                  <input
+                    id="color-min-elevation-input"
+                    type="text"
+                    inputMode="decimal"
+                    value={colorMinInput}
+                    onFocus={() => {
+                      isColorMinFocusedRef.current = true;
+                    }}
+                    onChange={(e) =>
+                      handleColorMinOrMaxInputChange(
+                        e.target.value,
+                        colorMaxInput,
+                        'min'
+                      )
+                    }
+                    onBlur={() => {
+                      isColorMinFocusedRef.current = false;
+                      commitColorMinInput();
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        isColorMinFocusedRef.current = false;
+                        commitColorMinInput();
+                        (e.target as HTMLInputElement).blur();
+                      }
+                    }}
+                    aria-label="Minimum Color Elevation Limit"
+                    data-testid="color-min-input"
+                    className="w-16 rounded-md bg-slate-950 border border-slate-700 px-1.5 py-0.5 text-right text-xs font-semibold font-mono-tabular text-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-400"
+                  />
+                </div>
+
+                <input
+                  type="range"
+                  min={colorConfig.domainMin}
+                  max={colorConfig.domainMax}
+                  step={colorConfig.step}
+                  value={colorConfig.minElevation}
+                  onChange={(e) => {
+                    const rawVal = roundScale(Number(e.target.value));
+                    const clampedMin = Math.max(
+                      colorConfig.domainMin,
+                      Math.min(rawVal, colorConfig.maxElevation)
+                    );
+                    onColorRangeChange(clampedMin, colorConfig.maxElevation);
+                    setColorRangeError(null);
+                  }}
+                  aria-label="Minimum Color Elevation Slider"
+                  data-testid="color-min-slider"
+                  className="w-full studio-slider"
+                />
+
+                <div className="flex items-center justify-between text-[9px] font-mono-tabular text-slate-500">
+                  <span>{colorConfig.domainMin}m</span>
+                  <span>{colorConfig.minElevation}m</span>
+                </div>
+              </div>
+
+              {/* Right Column: Maximum Value Slider & Input */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-1">
+                  <label
+                    htmlFor="color-max-elevation-input"
+                    className="text-[11px] font-medium text-slate-300 whitespace-nowrap"
+                  >
+                    Max (m)
+                  </label>
+                  <input
+                    id="color-max-elevation-input"
+                    type="text"
+                    inputMode="decimal"
+                    value={colorMaxInput}
+                    onFocus={() => {
+                      isColorMaxFocusedRef.current = true;
+                    }}
+                    onChange={(e) =>
+                      handleColorMinOrMaxInputChange(
+                        colorMinInput,
+                        e.target.value,
+                        'max'
+                      )
+                    }
+                    onBlur={() => {
+                      isColorMaxFocusedRef.current = false;
+                      commitColorMaxInput();
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        isColorMaxFocusedRef.current = false;
+                        commitColorMaxInput();
+                        (e.target as HTMLInputElement).blur();
+                      }
+                    }}
+                    aria-label="Maximum Color Elevation Limit"
+                    data-testid="color-max-input"
+                    className="w-16 rounded-md bg-slate-950 border border-slate-700 px-1.5 py-0.5 text-right text-xs font-semibold font-mono-tabular text-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-400"
+                  />
+                </div>
+
+                <input
+                  type="range"
+                  min={colorConfig.domainMin}
+                  max={colorConfig.domainMax}
+                  step={colorConfig.step}
+                  value={colorConfig.maxElevation}
+                  onChange={(e) => {
+                    const rawVal = roundScale(Number(e.target.value));
+                    const clampedMax = Math.min(
+                      colorConfig.domainMax,
+                      Math.max(rawVal, colorConfig.minElevation)
+                    );
+                    onColorRangeChange(colorConfig.minElevation, clampedMax);
+                    setColorRangeError(null);
+                  }}
+                  aria-label="Maximum Color Elevation Slider"
+                  data-testid="color-max-slider"
+                  className="w-full studio-slider"
+                />
+
+                <div className="flex items-center justify-between text-[9px] font-mono-tabular text-slate-500">
+                  <span>{colorConfig.maxElevation}m</span>
+                  <span>{colorConfig.domainMax}m</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Distribution & Interpolation Mode Toggles */}
+            <div className="grid grid-cols-2 gap-2 pt-0.5">
+              <div>
+                <span className="block text-[10px] font-medium text-slate-400 mb-1">
+                  Distribution
+                </span>
+                <div className="grid grid-cols-2 rounded-lg bg-slate-950 p-0.5 border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => onColorDistributionModeChange('even')}
+                    data-testid="dist-mode-even"
+                    className={`rounded-md py-1 text-[10px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                      colorConfig.distributionMode === 'even'
+                        ? 'bg-sky-500 text-slate-950 font-semibold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Even
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onColorDistributionModeChange('ratio')}
+                    data-testid="dist-mode-ratio"
+                    className={`rounded-md py-1 text-[10px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                      colorConfig.distributionMode === 'ratio'
+                        ? 'bg-sky-500 text-slate-950 font-semibold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Ratio
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <span className="block text-[10px] font-medium text-slate-400 mb-1">
+                  Color Blend
+                </span>
+                <div className="grid grid-cols-2 rounded-lg bg-slate-950 p-0.5 border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => onColorInterpolationChange('INTERPOLATED')}
+                    data-testid="interp-mode-smooth"
+                    className={`rounded-md py-1 text-[10px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                      colorConfig.interpolation === 'INTERPOLATED'
+                        ? 'bg-sky-500 text-slate-950 font-semibold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Smooth
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onColorInterpolationChange('DISCRETE')}
+                    data-testid="interp-mode-discrete"
+                    className={`rounded-md py-1 text-[10px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                      colorConfig.interpolation !== 'INTERPOLATED'
+                        ? 'bg-sky-500 text-slate-950 font-semibold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Bands
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {colorRangeError && (
+              <div
+                role="alert"
+                data-testid="color-range-error"
+                className="flex items-start gap-1.5 rounded-lg bg-rose-950/80 border border-rose-800 p-2 text-[11px] text-rose-200"
+              >
+                <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0 mt-0.5" />
+                <span>{colorRangeError}</span>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* SECTION 3: Collapsible Water Level / Flood Simulation Control */}
       <section className="p-3.5 border-b border-slate-800 space-y-3">
         <div className="flex items-center justify-between gap-2">
           <label className="inline-flex items-center gap-1.5 cursor-pointer">
@@ -597,7 +1066,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
         )}
       </section>
 
-      {/* SECTION 3: Information (Live Hover + Clicked Point Lock) */}
+      {/* SECTION 4: Information (Live Hover + Clicked Point Lock) */}
       <section className="p-3.5">
         <div className="flex items-center justify-between gap-2 mb-2">
           <div className="flex items-center gap-1.5">

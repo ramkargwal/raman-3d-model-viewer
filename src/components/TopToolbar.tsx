@@ -8,7 +8,7 @@ export interface TopToolbarProps {
   onResetModel: () => void;
 }
 
-export const TopToolbar: React.FC<TopToolbarProps> = ({
+export const TopToolbar: React.FC<TopToolbarProps> = React.memo(({
   onUploadFile,
   onCaptureScreenshot,
   onResetCamera,
@@ -83,4 +83,4 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
       </div>
     </header>
   );
-};
+});

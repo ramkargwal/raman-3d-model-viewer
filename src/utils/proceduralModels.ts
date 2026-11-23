@@ -1,5 +1,12 @@
 import * as THREE from 'three';
-import { getDiscreteElevationRgb } from './viewerLogic';
+import {
+  ElevationColorConfig,
+  MAX_ELEVATION_METERS,
+  MIN_ELEVATION_METERS,
+  computeElevationMetersFromBaseZ,
+  evaluateCustomElevationColorRgb,
+  getDiscreteElevationRgb,
+} from './viewerLogic';
 
 export const DEFAULT_MODEL_FILE_NAME = 'haryana_elevation_dem.glb';
 
@@ -129,11 +136,12 @@ export function buildDefaultModelGroup(): THREE.Group {
   root.add(frame);
 
   // 3. Primary Hero Relief: Haryana 3D Topographic DEM Mesh
-  const segs = 80;
+  const segs = 110;
   const demGeo = new THREE.PlaneGeometry(2.36, 2.36, segs, segs);
   demGeo.rotateX(-Math.PI / 2);
   const pos = demGeo.attributes.position;
   const colors = new Float32Array(pos.count * 3);
+  const skirtMask = new Uint8Array(pos.count);
 
   const minTerrainY = 0.25;
   const maxReliefHeight = 0.78;
@@ -151,6 +159,7 @@ export function buildDefaultModelGroup(): THREE.Group {
       colors[cIdx] = 0.2;
       colors[cIdx + 1] = 0.25;
       colors[cIdx + 2] = 0.33;
+      skirtMask[i] = 1;
     } else {
       const y = minTerrainY + normElev * maxReliefHeight;
       pos.setY(i, y);
@@ -158,10 +167,12 @@ export function buildDefaultModelGroup(): THREE.Group {
       colors[cIdx] = rgb[0];
       colors[cIdx + 1] = rgb[1];
       colors[cIdx + 2] = rgb[2];
+      skirtMask[i] = 0;
     }
   }
 
   demGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  demGeo.userData.skirtMask = skirtMask;
   demGeo.computeVertexNormals();
 
   const demMat = new THREE.MeshStandardMaterial({
@@ -175,9 +186,86 @@ export function buildDefaultModelGroup(): THREE.Group {
   demMesh.userData.isElevationSurface = true;
   demMesh.userData.minY = minTerrainY;
   demMesh.userData.maxY = minTerrainY + maxReliefHeight;
+  root.userData.elevationRange = {
+    min: MIN_ELEVATION_METERS,
+    max: MAX_ELEVATION_METERS,
+  };
   root.add(demMesh);
 
   return root;
+}
+
+function readElevationRangeFromRecord(
+  record: unknown
+): { min: number; max: number } | null {
+  if (!record || typeof record !== 'object') return null;
+  const obj = record as Record<string, unknown>;
+
+  const rangeVal = obj.elevationRange ?? obj.elevation_range;
+  if (Array.isArray(rangeVal) && rangeVal.length >= 2) {
+    const min = Number(rangeVal[0]);
+    const max = Number(rangeVal[1]);
+    if (Number.isFinite(min) && Number.isFinite(max) && max > min) {
+      return { min, max };
+    }
+  } else if (rangeVal && typeof rangeVal === 'object') {
+    const r = rangeVal as Record<string, unknown>;
+    const min = Number(r.min);
+    const max = Number(r.max);
+    if (Number.isFinite(min) && Number.isFinite(max) && max > min) {
+      return { min, max };
+    }
+  }
+
+  const minCandidate =
+    obj.minElevation ??
+    obj.min_elevation ??
+    obj.elevationMin ??
+    obj.elevation_min ??
+    obj.demMin ??
+    obj.dem_min;
+  const maxCandidate =
+    obj.maxElevation ??
+    obj.max_elevation ??
+    obj.elevationMax ??
+    obj.elevation_max ??
+    obj.demMax ??
+    obj.dem_max;
+
+  if (minCandidate !== undefined && maxCandidate !== undefined) {
+    const min = Number(minCandidate);
+    const max = Number(maxCandidate);
+    if (Number.isFinite(min) && Number.isFinite(max) && max > min) {
+      return { min, max };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Inspects glTF extras, root userData, and child mesh userData for explicit elevation bounds.
+ */
+export function extractElevationMetadataFromModel(
+  rawObject: THREE.Object3D,
+  extraSources: unknown[] = []
+): { min: number; max: number } | null {
+  for (const src of extraSources) {
+    const found = readElevationRangeFromRecord(src);
+    if (found) return found;
+  }
+
+  const fromRoot = readElevationRangeFromRecord(rawObject.userData);
+  if (fromRoot) return fromRoot;
+
+  let fromChild: { min: number; max: number } | null = null;
+  rawObject.traverse((child) => {
+    if (fromChild) return;
+    const found = readElevationRangeFromRecord(child.userData);
+    if (found) fromChild = found;
+  });
+
+  return fromChild;
 }
 
 /**
@@ -196,6 +284,17 @@ export function prepareModelForCrispViewing(
 
   let minY = fullBox.min.y;
   let maxY = fullBox.max.y;
+  let hasExplicitElevationSurface = false;
+
+  rawObject.traverse((child) => {
+    if (!(child as THREE.Mesh).isMesh) return;
+    const mesh = child as THREE.Mesh;
+    if (mesh.userData?.isElevationSurface) {
+      hasExplicitElevationSurface = true;
+    }
+  });
+
+  const replacedOriginals = new Set<THREE.Material>();
 
   rawObject.traverse((child) => {
     if (!(child as THREE.Mesh).isMesh) return;
@@ -210,8 +309,24 @@ export function prepareModelForCrispViewing(
       maxY = mesh.userData.maxY;
     }
 
+    mesh.userData.isTargetTerrainMesh = hasExplicitElevationSurface
+      ? Boolean(mesh.userData?.isElevationSurface)
+      : true;
+
     if (mesh.geometry && !mesh.geometry.attributes.normal) {
       mesh.geometry.computeVertexNormals();
+    }
+
+    // Clone materials so custom elevation color overrides never mutate unrelated shared materials
+    if (Array.isArray(mesh.material)) {
+      mesh.material = mesh.material.map((m) => {
+        if (!m) return m;
+        replacedOriginals.add(m);
+        return m.clone();
+      });
+    } else if (mesh.material) {
+      replacedOriginals.add(mesh.material);
+      mesh.material = mesh.material.clone();
     }
 
     const materials = Array.isArray(mesh.material)
@@ -237,13 +352,351 @@ export function prepareModelForCrispViewing(
         stdMat.map.anisotropy = maxAnisotropy;
         stdMat.map.needsUpdate = true;
       }
+
+      // Snapshot original material state for lossless restoration when Custom Color is turned Off
+      mat.userData.originalMap = stdMat.map ?? null;
+      mat.userData.originalVertexColors = Boolean(stdMat.vertexColors);
+      mat.userData.originalColorHex = stdMat.color
+        ? stdMat.color.getHex()
+        : 0xffffff;
+
       stdMat.needsUpdate = true;
     });
+
+    if (mesh.geometry) {
+      const geo = mesh.geometry;
+      if (!geo.userData.originalSnapshotSaved) {
+        geo.userData.originalUvAttr = geo.attributes.uv
+          ? geo.attributes.uv.clone()
+          : null;
+        geo.userData.originalColorAttr = geo.attributes.color
+          ? geo.attributes.color.clone()
+          : null;
+        geo.userData.originalSnapshotSaved = true;
+      }
+    }
   });
 
-  if (maxY - minY < 0.001) {
-    maxY = minY + 1.0;
+  // Dispose replaced original material instances (textures remain referenced by clones)
+  replacedOriginals.forEach((origMat) => origMat.dispose());
+
+  if (maxY - minY < 1e-7) {
+    maxY = minY + 1e-4;
   }
 
   return { minY, maxY };
+}
+
+/**
+ * Precomputes and caches unscaled elevation values (in meters ASL) for every vertex of
+ * every terrain mesh in rawObject so real-time slider updates execute instantaneously.
+ */
+export function cacheModelVertexElevations(params: {
+  rawObject: THREE.Object3D;
+  rawBoxMinY: number;
+  normFactor: number;
+  minReliefZ: number;
+  maxReliefZ: number;
+  minElevationMeters: number;
+  maxElevationMeters: number;
+}): void {
+  const {
+    rawObject,
+    rawBoxMinY,
+    normFactor,
+    minReliefZ,
+    maxReliefZ,
+    minElevationMeters,
+    maxElevationMeters,
+  } = params;
+  rawObject.updateMatrixWorld(true);
+  const invRootMatrix = new THREE.Matrix4().copy(rawObject.matrixWorld).invert();
+  const localToRootMatrix = new THREE.Matrix4();
+  const tempVec = new THREE.Vector3();
+
+  rawObject.traverse((child) => {
+    if (!(child as THREE.Mesh).isMesh) return;
+    const mesh = child as THREE.Mesh;
+    if (!mesh.userData?.isTargetTerrainMesh || !mesh.geometry) return;
+
+    const pos = mesh.geometry.attributes.position;
+    if (!pos) return;
+
+    localToRootMatrix.multiplyMatrices(invRootMatrix, mesh.matrixWorld);
+    const vertexElevations = new Float32Array(pos.count);
+
+    for (let i = 0; i < pos.count; i++) {
+      tempVec.fromBufferAttribute(pos, i).applyMatrix4(localToRootMatrix);
+      const baseZ = Math.max(0, (tempVec.y - rawBoxMinY) * normFactor);
+      vertexElevations[i] = computeElevationMetersFromBaseZ(
+        baseZ,
+        minReliefZ,
+        maxReliefZ,
+        minElevationMeters,
+        maxElevationMeters
+      );
+    }
+
+    mesh.geometry.userData.vertexElevations = vertexElevations;
+  });
+}
+
+function getElevationRampSignature(colorConfig: ElevationColorConfig): string {
+  const stopsKey = colorConfig.stops
+    .map((s) => `${s.elevation}:${s.hex}`)
+    .join('|');
+  return `${colorConfig.distributionMode}|${colorConfig.interpolation}|${stopsKey}`;
+}
+
+/**
+ * Populates a 1024x1 1D RGBA DataTexture buffer from the active ElevationColorConfig.
+ * The ramp pixels depend only on stops, distributionMode, and interpolation (not min/max range),
+ * so the texture can be reused across min/max slider drags with zero GPU texture churn.
+ */
+function populateElevationRampData(
+  data: Uint8Array,
+  width: number,
+  colorConfig: ElevationColorConfig
+): void {
+  const normalizedConfig = {
+    minElevation: 0,
+    maxElevation: 1,
+    interpolation: colorConfig.interpolation,
+    distributionMode: colorConfig.distributionMode,
+    stops: colorConfig.stops,
+  };
+
+  for (let x = 0; x < width; x++) {
+    const t = x / (width - 1);
+    const [r, g, b] = evaluateCustomElevationColorRgb(t, normalizedConfig);
+    const idx = x * 4;
+    data[idx] = Math.max(0, Math.min(255, Math.round(r * 255)));
+    data[idx + 1] = Math.max(0, Math.min(255, Math.round(g * 255)));
+    data[idx + 2] = Math.max(0, Math.min(255, Math.round(b * 255)));
+    data[idx + 3] = 255;
+  }
+}
+
+function createOrUpdateElevationRampTexture(
+  existing: THREE.DataTexture | null,
+  colorConfig: ElevationColorConfig
+): THREE.DataTexture {
+  const width = 1024;
+  const filter =
+    colorConfig.interpolation === 'INTERPOLATED'
+      ? THREE.LinearFilter
+      : THREE.NearestFilter;
+
+  if (
+    existing &&
+    existing.image &&
+    existing.image.width === width &&
+    existing.image.data instanceof Uint8Array
+  ) {
+    populateElevationRampData(existing.image.data, width, colorConfig);
+    existing.minFilter = filter;
+    existing.magFilter = filter;
+    existing.needsUpdate = true;
+    return existing;
+  }
+
+  const data = new Uint8Array(width * 4);
+  populateElevationRampData(data, width, colorConfig);
+
+  const texture = new THREE.DataTexture(data, width, 1, THREE.RGBAFormat);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.minFilter = filter;
+  texture.magFilter = filter;
+  texture.generateMipmaps = false;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+/**
+ * Applies or restores custom elevation color mapping across all target terrain meshes in the model.
+ * - When colorConfig.enabled === false: restores original textures, UVs, and vertex colors.
+ * - When colorConfig.enabled === true: maps each vertex's elevation in meters into [minElevation, maxElevation]
+ *   and binds the 1024-step QGIS color ramp texture.
+ */
+export function applyElevationColorConfigToModel(
+  rootObject: THREE.Object3D,
+  colorConfig: ElevationColorConfig
+): void {
+  const rampSignature = colorConfig.enabled
+    ? getElevationRampSignature(colorConfig)
+    : '';
+  const invSpan =
+    1 / Math.max(0.001, colorConfig.maxElevation - colorConfig.minElevation);
+  const minElev = colorConfig.minElevation;
+
+  let sharedRampTexture: THREE.DataTexture | null = null;
+  let sharedRampUpdated = false;
+  const disposedTextures = new Set<THREE.Texture>();
+
+  rootObject.traverse((child) => {
+    if (!(child as THREE.Mesh).isMesh) return;
+    const mesh = child as THREE.Mesh;
+    if (!mesh.userData?.isTargetTerrainMesh || !mesh.geometry) return;
+
+    const geo = mesh.geometry;
+    const materials = Array.isArray(mesh.material)
+      ? mesh.material
+      : [mesh.material];
+
+    if (!colorConfig.enabled) {
+      if (!mesh.userData.customColorApplied) return;
+
+      // Restore original geometry attributes
+      if (geo.userData.originalUvAttr) {
+        geo.setAttribute('uv', geo.userData.originalUvAttr.clone());
+      } else if (geo.getAttribute('uv')) {
+        geo.deleteAttribute('uv');
+      }
+      if (geo.userData.originalColorAttr) {
+        geo.setAttribute('color', geo.userData.originalColorAttr.clone());
+      } else if (geo.getAttribute('color')) {
+        geo.deleteAttribute('color');
+      }
+      geo.userData.customUvAllocated = false;
+      geo.userData.customSkirtColorsApplied = false;
+
+      materials.forEach((mat) => {
+        if (!mat) return;
+        const stdMat = mat as THREE.MeshStandardMaterial;
+        const rampTex = mat.userData.customRampTexture as
+          | THREE.Texture
+          | null
+          | undefined;
+        if (rampTex && !disposedTextures.has(rampTex)) {
+          rampTex.dispose();
+          disposedTextures.add(rampTex);
+        }
+        mat.userData.customRampTexture = null;
+        mat.userData.customRampKey = null;
+        stdMat.map = mat.userData.originalMap ?? null;
+        stdMat.vertexColors = Boolean(mat.userData.originalVertexColors);
+        if (stdMat.color && typeof mat.userData.originalColorHex === 'number') {
+          stdMat.color.setHex(mat.userData.originalColorHex);
+        }
+        stdMat.needsUpdate = true;
+      });
+      mesh.userData.customColorApplied = false;
+      return;
+    }
+
+    // Custom Color Mode enabled: update UVs (and apply skirtMask vertex colors once)
+    const vertexElevations = geo.userData.vertexElevations as
+      | Float32Array
+      | undefined;
+    if (!vertexElevations) return;
+
+    const count = vertexElevations.length;
+    let uvAttr = geo.getAttribute('uv') as THREE.BufferAttribute | undefined;
+    if (
+      !geo.userData.customUvAllocated ||
+      !uvAttr ||
+      uvAttr.count !== count ||
+      uvAttr.itemSize !== 2 ||
+      !(uvAttr.array instanceof Float32Array)
+    ) {
+      const uvArray = new Float32Array(count * 2);
+      for (let i = 0; i < count; i++) {
+        uvArray[i * 2 + 1] = 0.5;
+      }
+      uvAttr = new THREE.BufferAttribute(uvArray, 2);
+      geo.setAttribute('uv', uvAttr);
+      geo.userData.customUvAllocated = true;
+    }
+
+    const uvArray = uvAttr.array as Float32Array;
+    for (let i = 0; i < count; i++) {
+      uvArray[i * 2] = (vertexElevations[i] - minElev) * invSpan;
+    }
+    uvAttr.needsUpdate = true;
+
+    const skirtMask = geo.userData.skirtMask as Uint8Array | undefined;
+    if (skirtMask && !geo.userData.customSkirtColorsApplied) {
+      let colorAttr = geo.getAttribute('color') as
+        | THREE.BufferAttribute
+        | undefined;
+      if (
+        !colorAttr ||
+        colorAttr.count !== count ||
+        colorAttr.itemSize !== 3 ||
+        !(colorAttr.array instanceof Float32Array)
+      ) {
+        colorAttr = new THREE.BufferAttribute(new Float32Array(count * 3), 3);
+        geo.setAttribute('color', colorAttr);
+      }
+      const colorArray = colorAttr.array as Float32Array;
+      for (let i = 0; i < count; i++) {
+        const cIdx = i * 3;
+        if (skirtMask[i] === 1) {
+          colorArray[cIdx] = 0.2;
+          colorArray[cIdx + 1] = 0.25;
+          colorArray[cIdx + 2] = 0.33;
+        } else {
+          colorArray[cIdx] = 1.0;
+          colorArray[cIdx + 1] = 1.0;
+          colorArray[cIdx + 2] = 1.0;
+        }
+      }
+      colorAttr.needsUpdate = true;
+      geo.userData.customSkirtColorsApplied = true;
+    }
+
+    materials.forEach((mat) => {
+      if (!mat) return;
+      const stdMat = mat as THREE.MeshStandardMaterial;
+      const existingTex = (mat.userData.customRampTexture ??
+        null) as THREE.DataTexture | null;
+
+      if (!sharedRampTexture) {
+        if (existingTex && mat.userData.customRampKey === rampSignature) {
+          sharedRampTexture = existingTex;
+          sharedRampUpdated = true;
+        } else {
+          sharedRampTexture = createOrUpdateElevationRampTexture(
+            existingTex,
+            colorConfig
+          );
+          sharedRampUpdated = true;
+        }
+      } else if (!sharedRampUpdated) {
+        createOrUpdateElevationRampTexture(sharedRampTexture, colorConfig);
+        sharedRampUpdated = true;
+      }
+
+      if (
+        existingTex &&
+        existingTex !== sharedRampTexture &&
+        !disposedTextures.has(existingTex)
+      ) {
+        existingTex.dispose();
+        disposedTextures.add(existingTex);
+      }
+
+      const prevHasMap = Boolean(stdMat.map);
+      const nextVertexColors = Boolean(skirtMask);
+      const needsMaterialUpdate =
+        !prevHasMap ||
+        stdMat.map !== sharedRampTexture ||
+        stdMat.vertexColors !== nextVertexColors;
+
+      mat.userData.customRampTexture = sharedRampTexture;
+      mat.userData.customRampKey = rampSignature;
+      stdMat.map = sharedRampTexture;
+      stdMat.vertexColors = nextVertexColors;
+      if (stdMat.color) {
+        stdMat.color.setHex(0xffffff);
+      }
+      if (needsMaterialUpdate) {
+        stdMat.needsUpdate = true;
+      }
+    });
+
+    mesh.userData.customColorApplied = true;
+  });
 }

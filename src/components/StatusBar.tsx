@@ -5,7 +5,7 @@ export interface StatusBarProps {
   loadingStatus: 'Ready' | 'Loading' | 'Error';
 }
 
-export const StatusBar: React.FC<StatusBarProps> = ({
+export const StatusBar: React.FC<StatusBarProps> = React.memo(({
   fileName,
   loadingStatus,
 }) => {
@@ -41,4 +41,4 @@ export const StatusBar: React.FC<StatusBarProps> = ({
       </span>
     </footer>
   );
-};
+});

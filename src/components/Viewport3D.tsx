@@ -4,25 +4,33 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import {
   Dimensions3D,
+  ElevationColorConfig,
+  MAX_ELEVATION_METERS,
+  MIN_ELEVATION_METERS,
   MapClickPointInfo,
   WaterLevelConfig,
   computeCameraFit,
   computeClickedMapPointInfo,
   computeWaterPlaneWorldY,
   getZTransformationScale,
+  resolveModelElevationBounds,
   roundScale,
   validateModelFileName,
 } from '../utils/viewerLogic';
 import {
   DEFAULT_MODEL_FILE_NAME,
-  prepareModelForCrispViewing,
+  applyElevationColorConfigToModel,
   buildDefaultModelGroup,
+  cacheModelVertexElevations,
+  extractElevationMetadataFromModel,
+  prepareModelForCrispViewing,
 } from '../utils/proceduralModels';
 import { Upload, AlertCircle, X } from 'lucide-react';
 
 export interface Viewport3DProps {
   zScale: number;
   waterConfig: WaterLevelConfig;
+  colorConfig: ElevationColorConfig;
   uploadedFile: File | null;
   resetCameraTrigger: number;
   resetModelTrigger: number;
@@ -36,30 +44,67 @@ export interface Viewport3DProps {
   onLoadProgress: (progress: number) => void;
   onLoadSuccess: (fileName: string) => void;
   onLoadError: (errorMessage: string) => void;
+  onModelElevationBoundsChange?: (minElevation: number, maxElevation: number) => void;
   loadingProgress: number | null;
   errorMessage: string | null;
   onDismissError: () => void;
 }
 
+const TEXTURE_SLOTS = [
+  'map',
+  'normalMap',
+  'roughnessMap',
+  'metalnessMap',
+  'aoMap',
+  'emissiveMap',
+  'bumpMap',
+  'alphaMap',
+  'lightMap',
+] as const;
+
 function disposeObject3D(root: THREE.Object3D) {
+  const disposedTextures = new Set<THREE.Texture>();
+  const disposeTexture = (tex: unknown) => {
+    if (tex && typeof (tex as THREE.Texture).dispose === 'function') {
+      const texture = tex as THREE.Texture;
+      if (!disposedTextures.has(texture)) {
+        texture.dispose();
+        disposedTextures.add(texture);
+      }
+    }
+  };
+
   root.traverse((node) => {
     const mesh = node as THREE.Mesh;
     if (mesh.geometry) {
       mesh.geometry.dispose();
     }
     if (mesh.material) {
-      if (Array.isArray(mesh.material)) {
-        mesh.material.forEach((m) => m.dispose());
-      } else {
-        mesh.material.dispose();
-      }
+      const mats = Array.isArray(mesh.material)
+        ? mesh.material
+        : [mesh.material];
+      mats.forEach((m) => {
+        if (!m) return;
+        const stdMat = m as unknown as Record<string, unknown>;
+        for (const slot of TEXTURE_SLOTS) {
+          disposeTexture(stdMat[slot]);
+        }
+        disposeTexture(m.userData?.originalMap);
+        disposeTexture(m.userData?.customRampTexture);
+        if (m.userData) {
+          m.userData.originalMap = null;
+          m.userData.customRampTexture = null;
+        }
+        m.dispose();
+      });
     }
   });
 }
 
-export const Viewport3D: React.FC<Viewport3DProps> = ({
+export const Viewport3D: React.FC<Viewport3DProps> = React.memo(({
   zScale,
   waterConfig,
+  colorConfig,
   uploadedFile,
   resetCameraTrigger,
   resetModelTrigger,
@@ -73,6 +118,7 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
   onLoadProgress,
   onLoadSuccess,
   onLoadError,
+  onModelElevationBoundsChange,
   loadingProgress,
   errorMessage,
   onDismissError,
@@ -99,20 +145,33 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     minReliefZ: number;
     maxReliefZ: number;
     baseDimensions: Dimensions3D;
+    minElevationMeters: number;
+    maxElevationMeters: number;
   }>({
     minReliefZ: 0.22,
     maxReliefZ: 0.94,
     baseDimensions: { x: 2.4, y: 2.4, z: 0.94 },
+    minElevationMeters: MIN_ELEVATION_METERS,
+    maxElevationMeters: MAX_ELEVATION_METERS,
   });
 
   const pointerDownPosRef = useRef<{ x: number; y: number } | null>(null);
   const isPointerDownRef = useRef<boolean>(false);
+  const hoverRafRef = useRef<number>(0);
+  const pendingHoverPosRef = useRef<{ x: number; y: number } | null>(null);
+  const lastHoverActiveRef = useRef<boolean>(false);
 
   const defaultCameraPosRef = useRef<THREE.Vector3>(new THREE.Vector3(3.4, 2.6, 3.8));
   const defaultTargetRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 0.75, 0));
   const requestRenderRef = useRef<() => void>(() => {});
   const activeZScaleRef = useRef<number>(zScale);
   activeZScaleRef.current = zScale;
+  const activeWaterConfigRef = useRef<WaterLevelConfig>(waterConfig);
+  activeWaterConfigRef.current = waterConfig;
+  const activeColorConfigRef = useRef<ElevationColorConfig>(colorConfig);
+  activeColorConfigRef.current = colorConfig;
+  const loadedFileNameRef = useRef<string>(loadedFileName);
+  loadedFileNameRef.current = loadedFileName;
 
   const callbacksRef = useRef({
     onLoadStart,
@@ -121,6 +180,7 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     onLoadError,
     onSelectMapPoint,
     onHoverMapPoint,
+    onModelElevationBoundsChange,
   });
   callbacksRef.current = {
     onLoadStart,
@@ -129,6 +189,7 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     onLoadError,
     onSelectMapPoint,
     onHoverMapPoint,
+    onModelElevationBoundsChange,
   };
 
   const clearCurrentModel = (holder: THREE.Group) => {
@@ -142,7 +203,8 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
   const mountAndFrameModel = (
     rawObject: THREE.Object3D,
     displayName: string,
-    currentZScale: number
+    currentZScale: number,
+    gltfExtraSources: unknown[] = []
   ) => {
     const holder = modelHolderGroupRef.current;
     const zScaleGroup = zScaleGroupRef.current;
@@ -167,6 +229,49 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     const maxRawDim = Math.max(rawSize.x, rawSize.y, rawSize.z, 0.001);
     const normFactor = 2.4 / maxRawDim;
 
+    const minReliefZ = Math.max(0, (minY - rawBox.min.y) * normFactor);
+    const rawMaxReliefZ = (maxY - rawBox.min.y) * normFactor;
+    const maxReliefZ =
+      rawMaxReliefZ > minReliefZ + 1e-7 ? rawMaxReliefZ : minReliefZ + 1e-4;
+
+    const metadataRange = extractElevationMetadataFromModel(
+      rawObject,
+      gltfExtraSources
+    );
+    const resolvedBounds = resolveModelElevationBounds({
+      rawSize,
+      rawMinY: minY,
+      rawMaxY: maxY,
+      metadataRange,
+    });
+    const modelMinElevation = resolvedBounds.minElevation;
+    const modelMaxElevation = resolvedBounds.maxElevation;
+
+    callbacksRef.current.onModelElevationBoundsChange?.(
+      modelMinElevation,
+      modelMaxElevation
+    );
+
+    cacheModelVertexElevations({
+      rawObject,
+      rawBoxMinY: rawBox.min.y,
+      normFactor,
+      minReliefZ,
+      maxReliefZ,
+      minElevationMeters: modelMinElevation,
+      maxElevationMeters: modelMaxElevation,
+    });
+
+    if (activeColorConfigRef.current.enabled) {
+      applyElevationColorConfigToModel(rawObject, {
+        ...activeColorConfigRef.current,
+        domainMin: modelMinElevation,
+        domainMax: modelMaxElevation,
+        minElevation: modelMinElevation,
+        maxElevation: modelMaxElevation,
+      });
+    }
+
     const normalizationWrapper = new THREE.Group();
     normalizationWrapper.name = 'Model_Normalization_Group';
     normalizationWrapper.scale.setScalar(normFactor);
@@ -190,16 +295,12 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       z: roundScale(Math.max(rawSize.y * normFactor, 0.01)),
     };
 
-    const minReliefZ = roundScale(
-      Math.max(0, (minY - rawBox.min.y) * normFactor)
-    );
-    const maxReliefZ = roundScale(
-      Math.max(minReliefZ + 0.01, (maxY - rawBox.min.y) * normFactor)
-    );
     modelReliefBoundsRef.current = {
       minReliefZ,
       maxReliefZ,
       baseDimensions,
+      minElevationMeters: modelMinElevation,
+      maxElevationMeters: modelMaxElevation,
     };
 
     if (waterGroupRef.current) {
@@ -208,6 +309,18 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
         1,
         baseDimensions.y * 0.96
       );
+      if (activeWaterConfigRef.current.enabled) {
+        const waterY = computeWaterPlaneWorldY({
+          waterLevelMeters: activeWaterConfigRef.current.level,
+          minReliefZ,
+          maxReliefZ,
+          zScale: currentZScale,
+          minElevationMeters: modelMinElevation,
+          maxElevationMeters: modelMaxElevation,
+        });
+        waterGroupRef.current.position.set(0, waterY, 0);
+        waterGroupRef.current.updateMatrixWorld(true);
+      }
     }
 
     const scaleVec = getZTransformationScale(currentZScale);
@@ -450,8 +563,11 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       rafId = requestAnimationFrame(() => {
         renderDirty = false;
         isUpdatingControls = true;
-        controls.update();
+        const didDampMove = controls.update();
         isUpdatingControls = false;
+        if (controls.enableDamping && didDampMove) {
+          renderDirty = true;
+        }
         renderer.render(scene, camera);
         const done = () => {
           renderBusy = false;
@@ -477,7 +593,6 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
-      renderer.render(scene, camera);
       requestRender();
     };
     const resizeObserver = new ResizeObserver(handleResize);
@@ -486,7 +601,11 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
 
     return () => {
       cancelAnimationFrame(rafId);
+      cancelAnimationFrame(hoverRafRef.current);
+      hoverRafRef.current = 0;
+      pendingHoverPosRef.current = null;
       clearTimeout(timeoutId);
+      requestRenderRef.current = () => {};
       resizeObserver.disconnect();
       window.removeEventListener('resize', handleResize);
       controls.removeEventListener('change', requestRender);
@@ -499,6 +618,15 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       disposeObject3D(hoverMesh);
       disposeObject3D(markerGroup);
       renderer.dispose();
+      sceneRef.current = null;
+      cameraRef.current = null;
+      rendererRef.current = null;
+      controlsRef.current = null;
+      zScaleGroupRef.current = null;
+      modelHolderGroupRef.current = null;
+      clickMarkerGroupRef.current = null;
+      hoverMarkerMeshRef.current = null;
+      waterGroupRef.current = null;
     };
   }, []);
 
@@ -538,7 +666,10 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
           return;
         }
         callbacksRef.current.onLoadProgress(100);
-        mountAndFrameModel(gltf.scene, uploadedFile.name, activeZScaleRef.current);
+        mountAndFrameModel(gltf.scene, uploadedFile.name, activeZScaleRef.current, [
+          gltf.asset?.extras,
+          gltf.userData,
+        ]);
       },
       (event) => {
         if (isCancelled) return;
@@ -596,12 +727,20 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       return;
     }
 
-    const { minReliefZ, maxReliefZ, baseDimensions } = modelReliefBoundsRef.current;
+    const {
+      minReliefZ,
+      maxReliefZ,
+      baseDimensions,
+      minElevationMeters,
+      maxElevationMeters,
+    } = modelReliefBoundsRef.current;
     const waterY = computeWaterPlaneWorldY({
       waterLevelMeters: waterConfig.level,
       minReliefZ,
       maxReliefZ,
       zScale,
+      minElevationMeters,
+      maxElevationMeters,
     });
 
     waterGroup.visible = true;
@@ -625,6 +764,14 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     requestRenderRef.current();
   }, [zScale]);
 
+  // Update Custom Elevation Color Mapping in real time
+  useEffect(() => {
+    const holder = modelHolderGroupRef.current;
+    if (!holder || holder.children.length === 0) return;
+    applyElevationColorConfigToModel(holder, colorConfig);
+    requestRenderRef.current();
+  }, [colorConfig]);
+
   // High-Resolution Screenshot Capture
   useEffect(() => {
     if (captureTrigger === 0) return;
@@ -635,14 +782,14 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
 
     renderer.render(scene, camera);
     const dataUrl = renderer.domElement.toDataURL('image/png');
-    const cleanBase = loadedFileName.replace(/\.(glb|gltf)$/i, '');
+    const cleanBase = loadedFileNameRef.current.replace(/\.(glb|gltf)$/i, '');
     const a = document.createElement('a');
     a.href = dataUrl;
     a.download = `${cleanBase}-capture.png`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-  }, [captureTrigger, loadedFileName]);
+  }, [captureTrigger]);
 
   // Reset Camera
   useEffect(() => {
@@ -700,7 +847,7 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       -((clientY - rect.top) / rect.height) * 2 + 1
     );
 
-    zScaleGroup.updateMatrixWorld(true);
+    zScaleGroup.updateMatrixWorld(false);
     raycasterRef.current.setFromCamera(ndcRef.current, camera);
 
     const hits = raycasterRef.current.intersectObjects(holder.children, true);
@@ -709,7 +856,13 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     const surfaceHit =
       hits.find((h) => h.object.userData?.isElevationSurface) || hits[0];
 
-    const { minReliefZ, maxReliefZ, baseDimensions } = modelReliefBoundsRef.current;
+    const {
+      minReliefZ,
+      maxReliefZ,
+      baseDimensions,
+      minElevationMeters,
+      maxElevationMeters,
+    } = modelReliefBoundsRef.current;
     return computeClickedMapPointInfo({
       worldX: surfaceHit.point.x,
       worldHorizontalZ: surfaceHit.point.z,
@@ -718,10 +871,21 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       baseDimensions,
       minReliefZ,
       maxReliefZ,
+      minElevationMeters,
+      maxElevationMeters,
     });
   };
 
+  const cancelPendingHover = () => {
+    if (hoverRafRef.current) {
+      cancelAnimationFrame(hoverRafRef.current);
+      hoverRafRef.current = 0;
+    }
+    pendingHoverPosRef.current = null;
+  };
+
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    cancelPendingHover();
     if (e.button === 0) {
       pointerDownPosRef.current = { x: e.clientX, y: e.clientY };
     }
@@ -730,34 +894,58 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (isPointerDownRef.current) return;
-    const pointInfo = raycastSurfaceAtClientPos(e.clientX, e.clientY);
-    const hoverMesh = hoverMarkerMeshRef.current;
+    pendingHoverPosRef.current = { x: e.clientX, y: e.clientY };
+    if (hoverRafRef.current) return;
 
-    if (pointInfo) {
-      if (hoverMesh) {
-        hoverMesh.visible = true;
-        hoverMesh.position.set(pointInfo.x, pointInfo.scaledZ, pointInfo.y);
-        hoverMesh.updateMatrixWorld(true);
-        requestRenderRef.current();
+    hoverRafRef.current = requestAnimationFrame(() => {
+      hoverRafRef.current = 0;
+      const pos = pendingHoverPosRef.current;
+      pendingHoverPosRef.current = null;
+      if (!pos || isPointerDownRef.current) return;
+
+      const pointInfo = raycastSurfaceAtClientPos(pos.x, pos.y);
+      const hoverMesh = hoverMarkerMeshRef.current;
+
+      if (pointInfo) {
+        if (hoverMesh) {
+          hoverMesh.visible = true;
+          hoverMesh.position.set(pointInfo.x, pointInfo.scaledZ, pointInfo.y);
+          hoverMesh.updateMatrixWorld(true);
+          requestRenderRef.current();
+        }
+        lastHoverActiveRef.current = true;
+        callbacksRef.current.onHoverMapPoint(pointInfo);
+      } else {
+        if (hoverMesh && hoverMesh.visible) {
+          hoverMesh.visible = false;
+          requestRenderRef.current();
+        }
+        if (lastHoverActiveRef.current) {
+          lastHoverActiveRef.current = false;
+          callbacksRef.current.onHoverMapPoint(null);
+        }
       }
-      callbacksRef.current.onHoverMapPoint(pointInfo);
-    } else {
-      if (hoverMesh && hoverMesh.visible) {
-        hoverMesh.visible = false;
-        requestRenderRef.current();
-      }
-      callbacksRef.current.onHoverMapPoint(null);
-    }
+    });
   };
 
   const handlePointerLeave = () => {
+    cancelPendingHover();
     isPointerDownRef.current = false;
     const hoverMesh = hoverMarkerMeshRef.current;
     if (hoverMesh && hoverMesh.visible) {
       hoverMesh.visible = false;
       requestRenderRef.current();
     }
-    callbacksRef.current.onHoverMapPoint(null);
+    if (lastHoverActiveRef.current) {
+      lastHoverActiveRef.current = false;
+      callbacksRef.current.onHoverMapPoint(null);
+    }
+  };
+
+  const handlePointerCancel = () => {
+    cancelPendingHover();
+    isPointerDownRef.current = false;
+    pointerDownPosRef.current = null;
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -784,6 +972,7 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
   const handleDragLeave = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
     setIsDraggingOver(false);
   };
 
@@ -815,6 +1004,7 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerLeave={handlePointerLeave}
+        onPointerCancel={handlePointerCancel}
         onPointerUp={handlePointerUp}
         data-testid="webgl-canvas-mount"
         className="w-full h-full cursor-crosshair active:cursor-grabbing"
@@ -878,4 +1068,4 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       )}
     </div>
   );
-};
+});

@@ -1,17 +1,26 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { TopToolbar } from './components/TopToolbar';
 import { Viewport3D } from './components/Viewport3D';
 import { ControlPanel } from './components/ControlPanel';
 import { StatusBar } from './components/StatusBar';
 import {
+  ColorDistributionMode,
+  ColorMapInterpolationMode,
+  DEFAULT_ELEVATION_COLOR_CONFIG,
+  DEFAULT_QGIS_COLOR_MAP_ASSET_PATH,
+  DEFAULT_QGIS_COLOR_MAP_FILE_NAME,
   DEFAULT_WATER_LEVEL_CONFIG,
   DEFAULT_Z_SCALE_CONFIG,
+  ElevationColorConfig,
   MapClickPointInfo,
   WaterLevelConfig,
   ZScaleConfig,
   applyCustomWaterLevel,
   applyCustomZScale,
+  applyElevationColorDomain,
+  clampElevationColorRange,
   clampZScale,
+  parseQgisColorMapText,
   validateModelFileName,
 } from './utils/viewerLogic';
 import { DEFAULT_MODEL_FILE_NAME } from './utils/proceduralModels';
@@ -23,6 +32,10 @@ export default function App() {
 
   const [waterConfig, setWaterConfig] = useState<WaterLevelConfig>({
     ...DEFAULT_WATER_LEVEL_CONFIG,
+  });
+
+  const [colorConfig, setColorConfig] = useState<ElevationColorConfig>({
+    ...DEFAULT_ELEVATION_COLOR_CONFIG,
   });
 
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
@@ -37,6 +50,30 @@ export default function App() {
   const [resetCameraTrigger, setResetCameraTrigger] = useState<number>(0);
   const [resetModelTrigger, setResetModelTrigger] = useState<number>(0);
   const [captureTrigger, setCaptureTrigger] = useState<number>(0);
+
+  // Load attached QGIS color map file from public/assets/aistudio/haryana_color_48a943d1.txt
+  useEffect(() => {
+    let active = true;
+    fetch(DEFAULT_QGIS_COLOR_MAP_ASSET_PATH)
+      .then((res) => (res.ok ? res.text() : Promise.reject(new Error('Not found'))))
+      .then((text) => {
+        if (!active) return;
+        const parsed = parseQgisColorMapText(text);
+        if (parsed.valid) {
+          setColorConfig((prev) => ({
+            ...prev,
+            stops: parsed.stops,
+            interpolation: parsed.interpolation,
+          }));
+        }
+      })
+      .catch(() => {
+        // Fallback already populated in DEFAULT_ELEVATION_COLOR_CONFIG
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const handleZScaleChange = useCallback((newScale: number) => {
     setZScaleConfig((prev) => ({
@@ -105,6 +142,160 @@ export default function App() {
     }));
   }, []);
 
+  // Custom Elevation Color handlers
+  const handleToggleCustomColor = useCallback((enabled: boolean) => {
+    setColorConfig((prev) => ({ ...prev, enabled }));
+  }, []);
+
+  const handleColorRangeChange = useCallback((newMin: number, newMax: number) => {
+    setColorConfig((prev) => {
+      const clamped = clampElevationColorRange(
+        newMin,
+        newMax,
+        prev.domainMin,
+        prev.domainMax
+      );
+      return {
+        ...prev,
+        minElevation: clamped.minElevation,
+        maxElevation: clamped.maxElevation,
+      };
+    });
+  }, []);
+
+  const handleColorDomainChange = useCallback(
+    (
+      newDomainMin: number,
+      newDomainMax: number,
+      changedBound: 'min' | 'max' | 'both' = 'both'
+    ) => {
+      setColorConfig((prev) => {
+        const updated = applyElevationColorDomain(
+          prev,
+          newDomainMin,
+          newDomainMax,
+          changedBound
+        );
+        return {
+          ...prev,
+          minElevation: updated.minElevation,
+          maxElevation: updated.maxElevation,
+          domainMin: updated.domainMin,
+          domainMax: updated.domainMax,
+        };
+      });
+    },
+    []
+  );
+
+  const handleModelElevationBoundsChange = useCallback(
+    (modelMin: number, modelMax: number) => {
+      setColorConfig((prev) => ({
+        ...prev,
+        modelMinElevation: modelMin,
+        modelMaxElevation: modelMax,
+        domainMin: modelMin,
+        domainMax: modelMax,
+        minElevation: modelMin,
+        maxElevation: modelMax,
+      }));
+
+      setWaterConfig((prev) => {
+        const span = Math.max(1, modelMax - modelMin);
+        const isDefaultHaryana =
+          modelMin === DEFAULT_WATER_LEVEL_CONFIG.min &&
+          modelMax === DEFAULT_WATER_LEVEL_CONFIG.max;
+        const nextStep = isDefaultHaryana
+          ? DEFAULT_WATER_LEVEL_CONFIG.step
+          : span <= 50
+            ? 1
+            : span <= 2500
+              ? 5
+              : 10;
+        const nextLevel = isDefaultHaryana
+          ? DEFAULT_WATER_LEVEL_CONFIG.level
+          : Math.round(modelMin + span * 0.1);
+        return {
+          ...prev,
+          min: modelMin,
+          max: modelMax,
+          level: nextLevel,
+          step: nextStep,
+        };
+      });
+    },
+    []
+  );
+
+  const handleColorDistributionModeChange = useCallback(
+    (mode: ColorDistributionMode) => {
+      setColorConfig((prev) => ({
+        ...prev,
+        distributionMode: mode,
+      }));
+    },
+    []
+  );
+
+  const handleColorInterpolationChange = useCallback(
+    (mode: ColorMapInterpolationMode) => {
+      setColorConfig((prev) => ({
+        ...prev,
+        interpolation: mode,
+      }));
+    },
+    []
+  );
+
+  const handleUploadColorMapFile = useCallback((file: File) => {
+    setErrorMessage(null);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = typeof reader.result === 'string' ? reader.result : '';
+      const parsed = parseQgisColorMapText(text);
+      if (!parsed.valid) {
+        setErrorMessage(
+          parsed.error ||
+            'Failed to parse QGIS Color Map file. Ensure it contains valid elevation,R,G,B lines.'
+        );
+        return;
+      }
+      setColorConfig((prev) => {
+        const origMin = prev.modelMinElevation ?? DEFAULT_ELEVATION_COLOR_CONFIG.domainMin;
+        const origMax = prev.modelMaxElevation ?? DEFAULT_ELEVATION_COLOR_CONFIG.domainMax;
+        return {
+          ...prev,
+          enabled: true,
+          stops: parsed.stops,
+          interpolation: parsed.interpolation,
+          domainMin: origMin,
+          domainMax: origMax,
+          minElevation: origMin,
+          maxElevation: origMax,
+          fileName: file.name || DEFAULT_QGIS_COLOR_MAP_FILE_NAME,
+        };
+      });
+    };
+    reader.onerror = () => {
+      setErrorMessage(`Unable to read color map file "${file.name}".`);
+    };
+    reader.readAsText(file);
+  }, []);
+
+  const handleResetColorConfig = useCallback(() => {
+    setColorConfig((prev) => {
+      const origMin = prev.modelMinElevation ?? DEFAULT_ELEVATION_COLOR_CONFIG.domainMin;
+      const origMax = prev.modelMaxElevation ?? DEFAULT_ELEVATION_COLOR_CONFIG.domainMax;
+      return {
+        ...prev,
+        domainMin: origMin,
+        domainMax: origMax,
+        minElevation: origMin,
+        maxElevation: origMax,
+      };
+    });
+  }, []);
+
   const handleUploadFile = useCallback((file: File) => {
     setErrorMessage(null);
     const check = validateModelFileName(file.name);
@@ -135,6 +326,7 @@ export default function App() {
     setHoveredPoint(null);
     setWaterConfig({ ...DEFAULT_WATER_LEVEL_CONFIG });
     setZScaleConfig({ ...DEFAULT_Z_SCALE_CONFIG });
+    setColorConfig({ ...DEFAULT_ELEVATION_COLOR_CONFIG });
     setUploadedFile(null);
     setResetModelTrigger((prev) => prev + 1);
     setResetCameraTrigger((prev) => prev + 1);
@@ -162,6 +354,14 @@ export default function App() {
     setErrorMessage(errMsg);
   }, []);
 
+  const handleDismissError = useCallback(() => {
+    setErrorMessage(null);
+  }, []);
+
+  const handleClearClickedPoint = useCallback(() => {
+    setClickedPoint(null);
+  }, []);
+
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
       <TopToolbar
@@ -175,6 +375,7 @@ export default function App() {
         <Viewport3D
           zScale={zScaleConfig.scale}
           waterConfig={waterConfig}
+          colorConfig={colorConfig}
           uploadedFile={uploadedFile}
           resetCameraTrigger={resetCameraTrigger}
           resetModelTrigger={resetModelTrigger}
@@ -188,14 +389,16 @@ export default function App() {
           onLoadProgress={handleLoadProgress}
           onLoadSuccess={handleLoadSuccess}
           onLoadError={handleLoadError}
+          onModelElevationBoundsChange={handleModelElevationBoundsChange}
           loadingProgress={loadingProgress}
           errorMessage={errorMessage}
-          onDismissError={() => setErrorMessage(null)}
+          onDismissError={handleDismissError}
         />
 
         <ControlPanel
           zScaleConfig={zScaleConfig}
           waterConfig={waterConfig}
+          colorConfig={colorConfig}
           clickedPoint={clickedPoint}
           hoveredPoint={hoveredPoint}
           onZScaleChange={handleZScaleChange}
@@ -207,7 +410,14 @@ export default function App() {
           onCustomWaterLevelInput={handleCustomWaterLevelInput}
           onWaterRangeChange={handleWaterRangeChange}
           onWaterStepChange={handleWaterStepChange}
-          onClearClickedPoint={() => setClickedPoint(null)}
+          onToggleCustomColor={handleToggleCustomColor}
+          onColorRangeChange={handleColorRangeChange}
+          onColorDomainChange={handleColorDomainChange}
+          onColorDistributionModeChange={handleColorDistributionModeChange}
+          onColorInterpolationChange={handleColorInterpolationChange}
+          onUploadColorMapFile={handleUploadColorMapFile}
+          onResetColorConfig={handleResetColorConfig}
+          onClearClickedPoint={handleClearClickedPoint}
         />
       </main>
 
